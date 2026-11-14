@@ -1,0 +1,6 @@
+model_path: best.pt
+model_confidence: 0.25
+warmup_runs: 3
+mask_width_threshold_px: 580
+cv_gaussian_ksize: 3
+cv_binary_threshold: 50

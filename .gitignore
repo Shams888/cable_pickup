@@ -1,0 +1,17 @@
+# Images
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.gif
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.weights
+*.ckpt
+*.safetensors
