@@ -9,8 +9,13 @@ import yaml
 from loguru import logger
 from ultralytics import YOLO
 
-from cv_masks import detect_cv_masks, overlay_cv_masks
-from utils import filter_result_by_box_size
+from cv_masks import (
+    detect_cv_masks,
+    join_instance_masks,
+    overlay_cv_masks,
+    overlay_masks,
+    suppress_overlapping_masks,
+)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -50,10 +55,16 @@ class MODEL:
         self.model_confidence = float(self.get_param("model_confidence", 0.5))
         self.warmup_runs = int(self.get_param("warmup_runs", 1))
         self.mask_width_threshold_px = int(self.get_param("mask_width_threshold_px", 600))
-        self.cv_gaussian_ksize = int(self.get_param("cv_gaussian_ksize", 3))
+        self.cv_gaussian_ksize = int(self.get_param("cv_gaussian_ksize", 5))
         if self.cv_gaussian_ksize % 2 == 0:
             self.cv_gaussian_ksize += 1
         self.cv_binary_threshold = int(self.get_param("cv_binary_threshold", 70))
+        self.cv_min_piece_area = int(self.get_param("cv_min_piece_area", 300))
+        self.cv_max_gap_px = int(self.get_param("cv_max_gap_px", 120))
+        self.cv_max_join_angle_deg = float(self.get_param("cv_max_join_angle_deg", 25))
+        self.cv_join_width_px = int(self.get_param("cv_join_width_px", 15))
+        self.cv_min_cable_area = int(self.get_param("cv_min_cable_area", 8000))
+        self.mask_overlap_thresh = float(self.get_param("mask_overlap_thresh", 0.1))
         # ---------------- model ----------------
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -65,7 +76,9 @@ class MODEL:
             f"Loaded model '{model_path}' on {self.device} "
             f"(confidence={self.model_confidence}, warmup_runs={self.warmup_runs}, "
             f"mask_w>={self.mask_width_threshold_px}, "
-            f"cv_ksize={self.cv_gaussian_ksize}, cv_thresh={self.cv_binary_threshold})"
+            f"cv_ksize={self.cv_gaussian_ksize}, cv_thresh={self.cv_binary_threshold}, "
+            f"cv_gap={self.cv_max_gap_px}, cv_join_w={self.cv_join_width_px}, "
+            f"mask_ovlp>={self.mask_overlap_thresh})"
         )
 
         if getattr(self.model, "task", None) != "segment":
@@ -129,6 +142,16 @@ class MODEL:
             if self.cv_gaussian_ksize % 2 == 0:
                 self.cv_gaussian_ksize += 1
             self.cv_binary_threshold = int(self.get_param("cv_binary_threshold", self.cv_binary_threshold))
+            self.cv_min_piece_area = int(self.get_param("cv_min_piece_area", self.cv_min_piece_area))
+            self.cv_max_gap_px = int(self.get_param("cv_max_gap_px", self.cv_max_gap_px))
+            self.cv_max_join_angle_deg = float(
+                self.get_param("cv_max_join_angle_deg", self.cv_max_join_angle_deg)
+            )
+            self.cv_join_width_px = int(self.get_param("cv_join_width_px", self.cv_join_width_px))
+            self.cv_min_cable_area = int(self.get_param("cv_min_cable_area", self.cv_min_cable_area))
+            self.mask_overlap_thresh = float(
+                self.get_param("mask_overlap_thresh", self.mask_overlap_thresh)
+            )
         return ok
 
     def get_param(self, key, default=None):
@@ -143,6 +166,12 @@ class MODEL:
         mask_width_threshold_px=None,
         cv_gaussian_ksize=None,
         cv_binary_threshold=None,
+        cv_min_piece_area=None,
+        cv_max_gap_px=None,
+        cv_max_join_angle_deg=None,
+        cv_join_width_px=None,
+        cv_min_cable_area=None,
+        mask_overlap_thresh=None,
     ):
         """
         Run segmentation on one image and return a mask-annotated copy.
@@ -162,6 +191,18 @@ class MODEL:
             cv_gaussian_ksize = self.cv_gaussian_ksize
         if cv_binary_threshold is None:
             cv_binary_threshold = self.cv_binary_threshold
+        if cv_min_piece_area is None:
+            cv_min_piece_area = self.cv_min_piece_area
+        if cv_max_gap_px is None:
+            cv_max_gap_px = self.cv_max_gap_px
+        if cv_max_join_angle_deg is None:
+            cv_max_join_angle_deg = self.cv_max_join_angle_deg
+        if cv_join_width_px is None:
+            cv_join_width_px = self.cv_join_width_px
+        if cv_min_cable_area is None:
+            cv_min_cable_area = self.cv_min_cable_area
+        if mask_overlap_thresh is None:
+            mask_overlap_thresh = self.mask_overlap_thresh
 
         # ---- validate inputs ----
         if image is None:
@@ -196,14 +237,40 @@ class MODEL:
                 return image.copy()
 
             result = results[0]
-            result = filter_result_by_box_size(
-                result, mask_width_threshold_px, self.logger
-            )
+            h, w = image.shape[:2]
 
-            n_yolo = 0 if result.masks is None else len(result.masks)
-            yolo_masks = []
+            raw_masks, raw_scores = [], []
             if result.masks is not None:
-                yolo_masks = list(result.masks.data.detach().cpu().numpy())
+                raw_masks = list(result.masks.data.detach().cpu().numpy())
+                if result.boxes is not None and len(result.boxes):
+                    raw_scores = [
+                        float(c) for c in result.boxes.conf.detach().cpu().numpy()
+                    ]
+                else:
+                    raw_scores = [1.0] * len(raw_masks)
+
+            n_raw = len(raw_masks)
+            yolo_masks, yolo_scores = join_instance_masks(
+                raw_masks,
+                (h, w),
+                max_gap_px=cv_max_gap_px,
+                max_join_angle_deg=cv_max_join_angle_deg,
+                join_width_px=cv_join_width_px,
+                min_piece_area=cv_min_piece_area,
+                min_cable_area=cv_min_cable_area,
+                min_length=mask_width_threshold_px,
+                scores=raw_scores if raw_scores else None,
+            )
+            n_joined = len(yolo_masks)
+            yolo_masks, yolo_scores = suppress_overlapping_masks(
+                yolo_masks, yolo_scores, overlap_thresh=mask_overlap_thresh
+            )
+            n_yolo = len(yolo_masks)
+            if n_raw and self.logger is not None:
+                self.logger.info(
+                    f"infer: yolo masks raw={n_raw} -> joined={n_joined} "
+                    f"-> after_overlap={n_yolo}"
+                )
 
             cv_only = detect_cv_masks(
                 image,
@@ -211,11 +278,19 @@ class MODEL:
                 mask_width_threshold_px,
                 cv_gaussian_ksize,
                 cv_binary_threshold,
+                cv_min_piece_area,
+                cv_max_gap_px,
+                cv_max_join_angle_deg,
+                cv_join_width_px,
+                cv_min_cable_area,
                 self.logger,
             )
 
-            annotated = result.plot() if n_yolo > 0 else image.copy()
-            annotated = overlay_cv_masks(annotated, cv_only)  # green = CV-only
+            # Blue = processed YOLO, green = CV-only (plot() skipped: masks were remapped).
+            annotated = overlay_masks(
+                image, yolo_masks, color=(255, 0, 0), alpha=0.45, scores=yolo_scores
+            )
+            annotated = overlay_cv_masks(annotated, cv_only)
             self.logger.info(
                 f"infer: yolo={n_yolo}, cv={len(cv_only)}, conf={confidence_threshold}, "
                 f"took {time.time() - start:.3f} s"

@@ -1,6 +1,12 @@
 model_path: best.pt
 model_confidence: 0.25
 warmup_runs: 3
-mask_width_threshold_px: 580
-cv_gaussian_ksize: 3
-cv_binary_threshold: 50
+mask_width_threshold_px: 500
+cv_gaussian_ksize: 5
+cv_binary_threshold: 70
+cv_min_piece_area: 300
+cv_max_gap_px: 120
+cv_max_join_angle_deg: 25
+cv_join_width_px: 15
+cv_min_cable_area: 8000
+mask_overlap_thresh: 0.1
