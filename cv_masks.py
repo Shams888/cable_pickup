@@ -84,34 +84,70 @@ def _ends_should_join(ends_i, dir_i, ends_j, dir_j, max_gap_px, max_join_angle_d
 
 
 def _bridge_pieces_on_mask(
-    mask, pieces, max_gap_px, max_join_angle_deg, join_width_px, max_lateral_px=40
+    mask,
+    pieces,
+    max_gap_px,
+    max_join_angle_deg,
+    join_width_px,
+    max_lateral_px=40,
+    min_length=500,
 ):
     """Draw thin end-aligned bridges between piece contours onto mask (in-place)."""
     if len(pieces) < 2:
         return
     info = [_piece_ends(c) for c in pieces]
+    lengths = [_contour_length(c) for c in pieces]
+    cents = [_contour_centroid(c) for c in pieces]
+    long_thresh = max(float(min_length) * 0.75, 400.0)
     width = max(1, int(join_width_px))
     for i in range(len(pieces)):
         for j in range(i + 1, len(pieces)):
+            if lengths[i] >= long_thresh and lengths[j] >= long_thresh:
+                continue
             ends_i, dir_i = info[i]
             ends_j, dir_j = info[j]
             ok, pair = _ends_should_join(
                 ends_i, dir_i, ends_j, dir_j, max_gap_px, max_join_angle_deg, max_lateral_px
             )
-            if ok and pair is not None:
-                a, b = pair
-                cv2.line(
-                    mask,
-                    (int(a[0]), int(a[1])),
-                    (int(b[0]), int(b[1])),
-                    255,
-                    width,
-                )
+            if not ok or pair is None:
+                continue
+            axis = dir_i + dir_j
+            if float(np.dot(dir_i, dir_j)) < 0:
+                axis = dir_i - dir_j
+            nrm = np.linalg.norm(axis)
+            if nrm < 1e-6:
+                continue
+            axis = axis / nrm
+            delta = cents[j] - cents[i]
+            cent_lat = abs(float(delta[0] * (-axis[1]) + delta[1] * axis[0]))
+            if cent_lat > max(float(max_lateral_px) * 1.5, 50.0):
+                continue
+            a, b = pair
+            cv2.line(
+                mask,
+                (int(a[0]), int(a[1])),
+                (int(b[0]), int(b[1])),
+                255,
+                width,
+            )
 
 
 def _contour_passes_size(contour, min_cable_area, min_length):
     (_cx, _cy), (rw, rh), _ang = cv2.minAreaRect(contour)
     return cv2.contourArea(contour) >= float(min_cable_area) and max(rw, rh) >= float(min_length)
+
+
+def _contour_length(contour):
+    (_cx, _cy), (rw, rh), _ang = cv2.minAreaRect(contour)
+    return float(max(rw, rh))
+
+
+def _contour_centroid(contour):
+    m = cv2.moments(contour)
+    if m["m00"] == 0:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        return np.array([x + bw * 0.5, y + bh * 0.5], dtype=np.float64)
+    return np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]], dtype=np.float64)
 
 
 def join_instance_masks(
@@ -169,16 +205,35 @@ def join_instance_masks(
         if ri != rj:
             parent[rj] = ri
 
+    lengths = [_contour_length(c) for c in pieces]
+    # Two already-long masks are whole cables, not sticker fragments.
+    long_thresh = max(float(min_length) * 0.75, 400.0)
     info = [_piece_ends(c) for c in pieces]
+    cents = [_contour_centroid(c) for c in pieces]
     for i in range(n):
         for j in range(i + 1, n):
+            if lengths[i] >= long_thresh and lengths[j] >= long_thresh:
+                continue
             ends_i, dir_i = info[i]
             ends_j, dir_j = info[j]
             ok, _pair = _ends_should_join(
                 ends_i, dir_i, ends_j, dir_j, max_gap_px, max_join_angle_deg, max_lateral_px
             )
-            if ok:
-                union(i, j)
+            if not ok:
+                continue
+            # Same cable fragments share one centerline; parallel neighbors do not.
+            axis = dir_i + dir_j
+            if float(np.dot(dir_i, dir_j)) < 0:
+                axis = dir_i - dir_j
+            nrm = np.linalg.norm(axis)
+            if nrm < 1e-6:
+                continue
+            axis = axis / nrm
+            delta = cents[j] - cents[i]
+            cent_lat = abs(float(delta[0] * (-axis[1]) + delta[1] * axis[0]))
+            if cent_lat > max(float(max_lateral_px) * 1.5, 50.0):
+                continue
+            union(i, j)
 
     groups = {}
     for i in range(n):
@@ -203,6 +258,7 @@ def join_instance_masks(
                 max_join_angle_deg,
                 width,
                 max_lateral_px,
+                min_length,
             )
 
         contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -288,7 +344,10 @@ def _find_cable_contours(
 
     mask = np.zeros(binary.shape, dtype=np.uint8)
     cv2.drawContours(mask, pieces, -1, 255, cv2.FILLED)
-    _bridge_pieces_on_mask(mask, pieces, max_gap_px, max_join_angle_deg, join_width_px)
+    _bridge_pieces_on_mask(
+        mask, pieces, max_gap_px, max_join_angle_deg, join_width_px,
+        min_length=min_length,
+    )
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return [c for c in contours if _contour_passes_size(c, min_cable_area, min_length)]

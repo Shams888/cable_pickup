@@ -16,6 +16,7 @@ from cv_masks import (
     overlay_masks,
     suppress_overlapping_masks,
 )
+from utils import draw_pickup_points, pickup_points_for_masks
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -65,6 +66,10 @@ class MODEL:
         self.cv_join_width_px = int(self.get_param("cv_join_width_px", 15))
         self.cv_min_cable_area = int(self.get_param("cv_min_cable_area", 8000))
         self.mask_overlap_thresh = float(self.get_param("mask_overlap_thresh", 0.1))
+        self.enable_pickup = bool(self.get_param("enable_pickup", True))
+        self.pickup_fraction = float(self.get_param("pickup_fraction", 0.5))
+        self.pickup_offset_px = float(self.get_param("pickup_offset_px", 45))
+        self.pickup_marker_radius = int(self.get_param("pickup_marker_radius", 6))
         # ---------------- model ----------------
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -78,7 +83,7 @@ class MODEL:
             f"mask_w>={self.mask_width_threshold_px}, "
             f"cv_ksize={self.cv_gaussian_ksize}, cv_thresh={self.cv_binary_threshold}, "
             f"cv_gap={self.cv_max_gap_px}, cv_join_w={self.cv_join_width_px}, "
-            f"mask_ovlp>={self.mask_overlap_thresh})"
+            f"mask_ovlp>={self.mask_overlap_thresh}, pickup={self.enable_pickup})"
         )
 
         if getattr(self.model, "task", None) != "segment":
@@ -152,6 +157,12 @@ class MODEL:
             self.mask_overlap_thresh = float(
                 self.get_param("mask_overlap_thresh", self.mask_overlap_thresh)
             )
+            self.enable_pickup = bool(self.get_param("enable_pickup", self.enable_pickup))
+            self.pickup_fraction = float(self.get_param("pickup_fraction", self.pickup_fraction))
+            self.pickup_offset_px = float(self.get_param("pickup_offset_px", self.pickup_offset_px))
+            self.pickup_marker_radius = int(
+                self.get_param("pickup_marker_radius", self.pickup_marker_radius)
+            )
         return ok
 
     def get_param(self, key, default=None):
@@ -172,6 +183,10 @@ class MODEL:
         cv_join_width_px=None,
         cv_min_cable_area=None,
         mask_overlap_thresh=None,
+        enable_pickup=None,
+        pickup_fraction=None,
+        pickup_offset_px=None,
+        pickup_marker_radius=None,
     ):
         """
         Run segmentation on one image and return a mask-annotated copy.
@@ -203,6 +218,14 @@ class MODEL:
             cv_min_cable_area = self.cv_min_cable_area
         if mask_overlap_thresh is None:
             mask_overlap_thresh = self.mask_overlap_thresh
+        if enable_pickup is None:
+            enable_pickup = self.enable_pickup
+        if pickup_fraction is None:
+            pickup_fraction = self.pickup_fraction
+        if pickup_offset_px is None:
+            pickup_offset_px = self.pickup_offset_px
+        if pickup_marker_radius is None:
+            pickup_marker_radius = self.pickup_marker_radius
 
         # ---- validate inputs ----
         if image is None:
@@ -291,9 +314,24 @@ class MODEL:
                 image, yolo_masks, color=(255, 0, 0), alpha=0.45, scores=yolo_scores
             )
             annotated = overlay_cv_masks(annotated, cv_only)
+
+            n_pick = 0
+            if enable_pickup:
+                all_masks = list(yolo_masks) + list(cv_only)
+                picks = pickup_points_for_masks(
+                    all_masks,
+                    fraction=pickup_fraction,
+                    offset_px=pickup_offset_px,
+                    image=image,
+                )
+                n_pick = sum(1 for p in picks if p is not None)
+                annotated = draw_pickup_points(
+                    annotated, picks, radius=pickup_marker_radius, color=(0, 255, 255)
+                )
+
             self.logger.info(
-                f"infer: yolo={n_yolo}, cv={len(cv_only)}, conf={confidence_threshold}, "
-                f"took {time.time() - start:.3f} s"
+                f"infer: yolo={n_yolo}, cv={len(cv_only)}, pick={n_pick}, "
+                f"conf={confidence_threshold}, took {time.time() - start:.3f} s"
             )
             return annotated
         except Exception as e:

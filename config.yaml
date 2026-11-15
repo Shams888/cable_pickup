@@ -10,3 +10,9 @@ cv_max_join_angle_deg: 25
 cv_join_width_px: 15
 cv_min_cable_area: 8000
 mask_overlap_thresh: 0.1
+# Pickup (set enable_pickup: false to restore pre-pickup visuals).
+# Git restore point for join+filter: tag hook-pre-pickup
+enable_pickup: true
+pickup_fraction: 0.5
+pickup_offset_px: 45
+pickup_marker_radius: 6
