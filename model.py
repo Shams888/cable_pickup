@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from xml.sax.saxutils import escape
 
 import cv2
 import numpy as np
@@ -9,6 +10,7 @@ import yaml
 from loguru import logger
 from ultralytics import YOLO
 
+from annotation import Annotator
 from cv_masks import (
     detect_cv_masks,
     join_instance_masks,
@@ -16,9 +18,115 @@ from cv_masks import (
     overlay_masks,
     suppress_overlapping_masks,
 )
-from utils import draw_pickup_points, pickup_points_for_masks
+from image_io import bgr_to_pil, to_bgr
+from utils import pickup_point
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+CV_DUMMY_CONFIDENCE = 0.01
+
+
+def _mask_bbox_xyxy(mask):
+    ys, xs = np.where(np.asarray(mask) > 0)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _handoff_images(original_pil, annotated_bgr=None, overlay=None):
+    images = {"original": original_pil, "overlay": overlay}
+    if annotated_bgr is not None:
+        try:
+            images["annotated"] = bgr_to_pil(annotated_bgr)
+        except Exception as e:
+            logger.exception(f"_handoff_images: annotated convert failed: {e}")
+            try:
+                images["annotated"] = bgr_to_pil(_dummy_bgr())
+            except Exception as e2:
+                logger.exception(f"_handoff_images: dummy annotated failed: {e2}")
+    return images
+
+
+def _dummy_bgr(size=(720, 1280)):
+    """Black BGR placeholder when no valid image is available."""
+    h, w = size
+    return np.zeros((h, w, 3), dtype=np.uint8)
+
+
+def _annotate_exception(message, image_bgr=None):
+    """
+    Draw exception text on OpenCV image + SVG.
+    If image_bgr is missing/invalid, use a black 1280x720 canvas.
+    Never raises — always returns (bgr, svg_str).
+    """
+    try:
+        if image_bgr is None or not isinstance(image_bgr, np.ndarray) or image_bgr.size == 0:
+            canvas = _dummy_bgr()
+        else:
+            canvas = image_bgr.copy()
+            if canvas.ndim == 2:
+                canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+            elif canvas.ndim == 3 and canvas.shape[2] != 3:
+                canvas = canvas[:, :, :3] if canvas.shape[2] > 3 else _dummy_bgr()
+            if canvas.dtype != np.uint8:
+                canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+    except Exception as e:
+        logger.exception(f"_annotate_exception: canvas prep failed: {e}")
+        canvas = _dummy_bgr()
+
+    text = f"Exception: {message}"
+    try:
+        ann = Annotator(canvas, draw_on_image=True)
+        max_chars = 90
+        lines = [text[i:i + max_chars] for i in range(0, max(len(text), 1), max_chars)] or [text]
+        y = 40
+        for line in lines[:12]:
+            ann.text(line, (20, y), color=(0, 0, 255), font_scale=0.6, thickness=2)
+            y += 28
+        return ann.get_image(), ann.get_svg()
+    except Exception as e:
+        logger.exception(f"_annotate_exception: draw failed: {e}")
+        # Last-resort OpenCV-only text + minimal SVG (never raise).
+        try:
+            cv2.putText(
+                canvas, text[:90], (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (0, 0, 255), 2, cv2.LINE_AA,
+            )
+        except Exception as e2:
+            logger.exception(f"_annotate_exception: putText failed: {e2}")
+            canvas = _dummy_bgr()
+        h, w = canvas.shape[:2]
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+            f'viewBox="0 0 {w} {h}">'
+            f'<text x="20" y="40" fill="rgb(255,0,0)" font-size="18" '
+            f'font-family="sans-serif">{escape(text[:200])}</text></svg>'
+        )
+        return canvas, svg
+
+
+def _failure_images(message, image_bgr=None, original_pil=None):
+    """Build handoff images for VISION_FAILURE. Never raises."""
+    try:
+        annotated_bgr, overlay = _annotate_exception(message, image_bgr=image_bgr)
+    except Exception as e:
+        logger.exception(f"_failure_images: annotate failed: {e}")
+        annotated_bgr, overlay = _dummy_bgr(), None
+    try:
+        if original_pil is None:
+            src = image_bgr if isinstance(image_bgr, np.ndarray) and image_bgr.size else annotated_bgr
+            original_pil = bgr_to_pil(src)
+    except Exception as e:
+        logger.exception(f"_failure_images: original convert failed: {e}")
+        try:
+            original_pil = bgr_to_pil(annotated_bgr)
+        except Exception as e2:
+            logger.exception(f"_failure_images: dummy original failed: {e2}")
+            original_pil = None
+    try:
+        return _handoff_images(original_pil, annotated_bgr, overlay)
+    except Exception as e:
+        logger.exception(f"_failure_images: handoff failed: {e}")
+        return {"original": original_pil, "annotated": None, "overlay": overlay}
 
 
 class MODEL:
@@ -111,7 +219,7 @@ class MODEL:
             with open(self.yaml_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         except Exception as e:
-            self.logger.error(f"Could not read YAML '{self.yaml_path}': {e} (keeping old parameters)")
+            self.logger.exception(f"Could not read YAML '{self.yaml_path}': {e} (keeping old parameters)")
             return False
 
         if not isinstance(data, dict):
@@ -138,32 +246,40 @@ class MODEL:
             return False  # nothing changed
 
         self.logger.info("YAML file changed, reloading parameters...")
-        ok = self.load_params()
-        if ok:
-            self.model_confidence = float(self.get_param("model_confidence", self.model_confidence))
-            self.warmup_runs = int(self.get_param("warmup_runs", self.warmup_runs))
-            self.mask_width_threshold_px = int(self.get_param("mask_width_threshold_px", self.mask_width_threshold_px))
-            self.cv_gaussian_ksize = int(self.get_param("cv_gaussian_ksize", self.cv_gaussian_ksize))
-            if self.cv_gaussian_ksize % 2 == 0:
-                self.cv_gaussian_ksize += 1
-            self.cv_binary_threshold = int(self.get_param("cv_binary_threshold", self.cv_binary_threshold))
-            self.cv_min_piece_area = int(self.get_param("cv_min_piece_area", self.cv_min_piece_area))
-            self.cv_max_gap_px = int(self.get_param("cv_max_gap_px", self.cv_max_gap_px))
-            self.cv_max_join_angle_deg = float(
-                self.get_param("cv_max_join_angle_deg", self.cv_max_join_angle_deg)
-            )
-            self.cv_join_width_px = int(self.get_param("cv_join_width_px", self.cv_join_width_px))
-            self.cv_min_cable_area = int(self.get_param("cv_min_cable_area", self.cv_min_cable_area))
-            self.mask_overlap_thresh = float(
-                self.get_param("mask_overlap_thresh", self.mask_overlap_thresh)
-            )
-            self.enable_pickup = bool(self.get_param("enable_pickup", self.enable_pickup))
-            self.pickup_fraction = float(self.get_param("pickup_fraction", self.pickup_fraction))
-            self.pickup_offset_px = float(self.get_param("pickup_offset_px", self.pickup_offset_px))
-            self.pickup_marker_radius = int(
-                self.get_param("pickup_marker_radius", self.pickup_marker_radius)
-            )
-        return ok
+        try:
+            ok = self.load_params()
+            if ok:
+                self.model_confidence = float(self.get_param("model_confidence", self.model_confidence))
+                self.warmup_runs = int(self.get_param("warmup_runs", self.warmup_runs))
+                self.mask_width_threshold_px = int(
+                    self.get_param("mask_width_threshold_px", self.mask_width_threshold_px)
+                )
+                self.cv_gaussian_ksize = int(self.get_param("cv_gaussian_ksize", self.cv_gaussian_ksize))
+                if self.cv_gaussian_ksize % 2 == 0:
+                    self.cv_gaussian_ksize += 1
+                self.cv_binary_threshold = int(
+                    self.get_param("cv_binary_threshold", self.cv_binary_threshold)
+                )
+                self.cv_min_piece_area = int(self.get_param("cv_min_piece_area", self.cv_min_piece_area))
+                self.cv_max_gap_px = int(self.get_param("cv_max_gap_px", self.cv_max_gap_px))
+                self.cv_max_join_angle_deg = float(
+                    self.get_param("cv_max_join_angle_deg", self.cv_max_join_angle_deg)
+                )
+                self.cv_join_width_px = int(self.get_param("cv_join_width_px", self.cv_join_width_px))
+                self.cv_min_cable_area = int(self.get_param("cv_min_cable_area", self.cv_min_cable_area))
+                self.mask_overlap_thresh = float(
+                    self.get_param("mask_overlap_thresh", self.mask_overlap_thresh)
+                )
+                self.enable_pickup = bool(self.get_param("enable_pickup", self.enable_pickup))
+                self.pickup_fraction = float(self.get_param("pickup_fraction", self.pickup_fraction))
+                self.pickup_offset_px = float(self.get_param("pickup_offset_px", self.pickup_offset_px))
+                self.pickup_marker_radius = int(
+                    self.get_param("pickup_marker_radius", self.pickup_marker_radius)
+                )
+            return ok
+        except Exception as e:
+            self.logger.exception(f"reload_params_if_changed failed (keeping old params): {e}")
+            return False
 
     def get_param(self, key, default=None):
         """Safe way to read one parameter: returns `default` if the key is missing."""
@@ -189,12 +305,17 @@ class MODEL:
         pickup_marker_radius=None,
     ):
         """
-        Run segmentation on one image and return a mask-annotated copy.
+        Run segmentation and return a Phase-3.1 style handoff:
 
-        On any failure, logs the error and returns a copy of the input image
-        (or None if the image itself is invalid).
+            ("GRASP", grasp_dict, images_dict)
+            ("EMPTY", None, images_dict)
+            ("VISION_FAILURE", None, images_dict or {})
+
+        grasp_dict: {"uv": [u, v], "angle_deg": 0.0, "confidence": float}
+        images_dict: {"original": PIL, "annotated": PIL, "overlay": svg|None}
         """
         start = time.time()
+        original_pil = None
 
         if confidence_threshold is None:
             confidence_threshold = self.model_confidence
@@ -227,37 +348,40 @@ class MODEL:
         if pickup_marker_radius is None:
             pickup_marker_radius = self.pickup_marker_radius
 
-        # ---- validate inputs ----
-        if image is None:
-            self.logger.error("infer: image is None")
-            return None
+        # ---- validate / convert inputs (PIL or ndarray -> BGR) ----
         try:
-            if not isinstance(image, np.ndarray) or image.size == 0:
-                self.logger.error("infer: image must be a non-empty numpy array")
-                return None
+            self.logger.info("infer: normalizing input image to BGR")
+            image = to_bgr(image)
+            original_pil = bgr_to_pil(image)
+            self.logger.info(f"infer: image ready shape={image.shape}")
         except Exception as e:
-            self.logger.error(f"infer: bad image: {e}")
-            return None
+            self.logger.exception(f"infer: bad image: {e}")
+            return "VISION_FAILURE", None, _failure_images(str(e), image_bgr=None, original_pil=None)
 
         if model is None:
             self.logger.error("infer: model is None")
-            return None
+            return "VISION_FAILURE", None, _failure_images(
+                "model is None", image_bgr=image, original_pil=original_pil
+            )
 
         try:
             confidence_threshold = float(confidence_threshold)
             if not (0.0 <= confidence_threshold <= 1.0):
                 self.logger.warning(f"infer: confidence {confidence_threshold} out of [0, 1], clamping")
                 confidence_threshold = max(0.0, min(1.0, confidence_threshold))
-        except (TypeError, ValueError) as e:
-            self.logger.error(f"infer: bad confidence_threshold={confidence_threshold!r}: {e}")
-            return image.copy()
+        except Exception as e:
+            self.logger.exception(f"infer: bad confidence_threshold={confidence_threshold!r}: {e}")
+            return "VISION_FAILURE", None, _failure_images(
+                str(e), image_bgr=image, original_pil=original_pil
+            )
 
         # ---- predict + annotate ----
         try:
+            self.logger.info(f"infer: predict conf={confidence_threshold}")
             results = model.predict(image, conf=confidence_threshold, verbose=False)
             if not results:
                 self.logger.warning("infer: no results from model")
-                return image.copy()
+                return "EMPTY", None, _handoff_images(original_pil, image, None)
 
             result = results[0]
             h, w = image.shape[:2]
@@ -315,36 +439,97 @@ class MODEL:
             )
             annotated = overlay_cv_masks(annotated, cv_only)
 
-            n_pick = 0
+            # Candidates: YOLO by real conf first, CV last with dummy conf.
+            candidates = []
+            for mask, score in zip(yolo_masks, yolo_scores):
+                candidates.append((float(score), "yolo", mask))
+            for mask in cv_only:
+                candidates.append((float(CV_DUMMY_CONFIDENCE), "cv", mask))
+            candidates.sort(key=lambda item: -item[0])
+
+            best = None
             if enable_pickup:
-                all_masks = list(yolo_masks) + list(cv_only)
-                picks = pickup_points_for_masks(
-                    all_masks,
-                    fraction=pickup_fraction,
-                    offset_px=pickup_offset_px,
-                    image=image,
+                self.logger.info(
+                    f"infer: selecting pickup among {len(candidates)} candidate(s)"
                 )
-                n_pick = sum(1 for p in picks if p is not None)
-                annotated = draw_pickup_points(
-                    annotated, picks, radius=pickup_marker_radius, color=(0, 255, 255)
-                )
+                for conf, source, mask in candidates:
+                    try:
+                        pt = pickup_point(
+                            mask,
+                            fraction=pickup_fraction,
+                            offset_px=pickup_offset_px,
+                            image=image,
+                        )
+                    except Exception as e:
+                        self.logger.exception(
+                            f"infer: pickup_point failed source={source} conf={conf}: {e}"
+                        )
+                        pt = None
+                    if pt is not None:
+                        best = (conf, source, mask, pt)
+                        self.logger.info(
+                            f"infer: selected pickup source={source} conf={conf:.3f} uv={pt}"
+                        )
+                        break
+
+            # SVG + bbox colors: blue YOLO, green CV, red = selected for grasp.
+            ann = Annotator(annotated, draw_on_image=True)
+            for conf, source, mask in candidates:
+                box = _mask_bbox_xyxy(mask)
+                if box is None:
+                    continue
+                selected = best is not None and mask is best[2]
+                if selected:
+                    color = (0, 0, 255)  # red (BGR)
+                elif source == "yolo":
+                    color = (255, 0, 0)  # blue
+                else:
+                    color = (0, 255, 0)  # green
+                x1, y1, x2, y2 = box
+                ann.box(x1, y1, x2, y2, color=color, thickness=2)
+
+            overlay = None
+            grasp = None
+            outcome = "EMPTY"
+            if best is not None:
+                conf, source, mask, (u, v) = best
+                ann.circle((u, v), radius=pickup_marker_radius, color=(0, 255, 255), filled=True)
+                grasp = {
+                    "uv": [float(u), float(v)],
+                    "angle_deg": 0.0,
+                    "confidence": float(conf),
+                }
+                outcome = "GRASP"
+                overlay = ann.get_svg()
+            else:
+                self.logger.warning("infer: no valid pickup point found")
+                overlay = ann.get_svg() if candidates else None
+
+            annotated = ann.get_image()
+            images = _handoff_images(original_pil, annotated, overlay)
 
             self.logger.info(
-                f"infer: yolo={n_yolo}, cv={len(cv_only)}, pick={n_pick}, "
+                f"infer: outcome={outcome}, yolo={n_yolo}, cv={len(cv_only)}, "
                 f"conf={confidence_threshold}, took {time.time() - start:.3f} s"
             )
-            return annotated
+            return outcome, grasp, images
         except Exception as e:
-            self.logger.error(f"infer failed: {e}")
-            try:
-                return image.copy()
-            except Exception:
-                return None
+            self.logger.exception(f"infer failed: {e}")
+            return "VISION_FAILURE", None, _failure_images(
+                str(e),
+                image_bgr=image if isinstance(image, np.ndarray) else None,
+                original_pil=original_pil,
+            )
 
     def process(self, image):
-        """Run inference on one image and return the annotated result."""
-        self.reload_params_if_changed()
-        return self.infer(image)
+        """Run inference; returns the same GRASP handoff tuple as infer()."""
+        try:
+            self.reload_params_if_changed()
+            return self.infer(image)
+        except Exception as e:
+            self.logger.exception(f"process failed: {e}")
+            return "VISION_FAILURE", None, _failure_images(str(e), image_bgr=None, original_pil=None)
+
 
 
 if __name__ == "__main__":
@@ -383,21 +568,24 @@ if __name__ == "__main__":
                 fail += 1
                 continue
 
-            annotated = m.process(image)
-            if annotated is None:
-                m.logger.error(f"process returned None for {name}")
+            outcome, grasp, images = m.process(image)
+            annotated_pil = images.get("annotated") if isinstance(images, dict) else None
+            if annotated_pil is None:
+                m.logger.error(f"process returned no annotated image for {name} ({outcome})")
                 fail += 1
                 continue
 
+            annotated = to_bgr(annotated_pil)
             if not cv2.imwrite(out_path, annotated):
                 m.logger.error(f"Could not save: {out_path}")
                 fail += 1
                 continue
 
-            m.logger.info(f"Saved {out_path}")
+            uv = grasp.get("uv") if grasp else None
+            m.logger.info(f"Saved {out_path} ({outcome}, uv={uv})")
             ok += 1
         except Exception as e:
-            m.logger.error(f"Failed on {name}: {e}")
+            m.logger.exception(f"Failed on {name}: {e}")
             fail += 1
 
     m.logger.info(f"Done: {ok} saved, {fail} failed")

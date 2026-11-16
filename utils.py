@@ -2,29 +2,35 @@
 
 import cv2
 import numpy as np
+from loguru import logger as _log
 
 
 def filter_result_by_box_size(result, min_width, logger=None):
     """
     Drop detections whose longest box side is below the given threshold.
     """
-    n_before = 0 if result.boxes is None else len(result.boxes)
+    log = logger if logger is not None else _log
+    try:
+        n_before = 0 if result.boxes is None else len(result.boxes)
 
-    if n_before > 0:
-        xyxy = result.boxes.xyxy.detach().cpu().numpy()
-        keep = [
-            i for i, (x1, y1, x2, y2) in enumerate(xyxy)
-            if max(x2 - x1, y2 - y1) >= min_width
-        ]
-        n_dropped = n_before - len(keep)
-        if n_dropped and logger is not None:
-            logger.info(
-                f"infer: dropped {n_dropped}/{n_before} mask(s) "
-                f"(need max(w,h)>={min_width})"
-            )
-        result = result[keep] if keep else result[[]]
+        if n_before > 0:
+            xyxy = result.boxes.xyxy.detach().cpu().numpy()
+            keep = [
+                i for i, (x1, y1, x2, y2) in enumerate(xyxy)
+                if max(x2 - x1, y2 - y1) >= min_width
+            ]
+            n_dropped = n_before - len(keep)
+            if n_dropped:
+                log.info(
+                    f"infer: dropped {n_dropped}/{n_before} mask(s) "
+                    f"(need max(w,h)>={min_width})"
+                )
+            result = result[keep] if keep else result[[]]
 
-    return result
+        return result
+    except Exception as e:
+        log.exception(f"filter_result_by_box_size failed: {e}")
+        return result
 
 
 def _mask_pca_axis(mask):
@@ -160,90 +166,106 @@ def pickup_point(
     - Step `offset_px` further; prefer the side that looks like dark wire
       (not white label) and stays wire-thin.
     """
-    parsed = _mask_pca_axis(mask)
-    if parsed is None:
-        m = (np.asarray(mask) > 0).astype(np.uint8)
-        if not m.any():
-            return None
-        ys, xs = np.where(m > 0)
-        return float(xs.mean()), float(ys.mean())
+    try:
+        parsed = _mask_pca_axis(mask)
+        if parsed is None:
+            m = (np.asarray(mask) > 0).astype(np.uint8)
+            if not m.any():
+                _log.info("pickup_point: empty mask")
+                return None
+            ys, xs = np.where(m > 0)
+            _log.info("pickup_point: PCA failed, using centroid")
+            return float(xs.mean()), float(ys.mean())
 
-    pts, axis, proj, t0, t1, m = parsed
-    dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
-    samples, radii = _radius_profile(pts, proj, dist, t0, t1, step_px=2.0, band_px=band_px)
-    gray_prof = _gray_along(samples, pts, proj, image, band_px=band_px)
+        pts, axis, proj, t0, t1, m = parsed
+        dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+        samples, radii = _radius_profile(pts, proj, dist, t0, t1, step_px=2.0, band_px=band_px)
+        gray_prof = _gray_along(samples, pts, proj, image, band_px=band_px)
 
-    positive = radii > 0
-    wire_ref = float(np.percentile(radii[positive], 40)) if np.any(positive) else 1.0
-    clip_i = _find_clip_index(samples, radii, t0, t1, fraction, clip_window, wire_ref)
+        positive = radii > 0
+        wire_ref = float(np.percentile(radii[positive], 40)) if np.any(positive) else 1.0
+        clip_i = _find_clip_index(samples, radii, t0, t1, fraction, clip_window, wire_ref)
 
-    # Leave the clip bulge on each side, then apply a fixed extra offset.
-    step = float(np.mean(np.diff(samples))) if len(samples) > 1 else 2.0
-    extra = max(1, int(round(float(offset_px) / max(step, 1e-3))))
-    span = t1 - t0
-    margin = 0.12 * span
+        # Leave the clip bulge on each side, then apply a fixed extra offset.
+        step = float(np.mean(np.diff(samples))) if len(samples) > 1 else 2.0
+        extra = max(1, int(round(float(offset_px) / max(step, 1e-3))))
+        span = t1 - t0
+        margin = 0.12 * span
 
-    def label_side_score(direction):
-        """Prefer the side that has a white sticker between clip and that end."""
-        if direction < 0:
-            lo, hi = 0, clip_i
-        else:
-            lo, hi = clip_i, len(samples) - 1
-        if hi <= lo:
-            return 0.0
-        # Near-clip band on that side (where labels usually sit).
-        near = slice(lo, hi + 1)
-        g = gray_prof[near]
-        r = radii[near]
-        if g.size == 0:
-            return 0.0
-        # Bright & not thick like a connector => sticker evidence.
-        bright = g > 150
-        wireish = r < wire_ref * 1.5
-        return float(np.sum(bright & wireish)) + 0.05 * float(g.max())
+        def label_side_score(direction):
+            """Prefer the side that has a white sticker between clip and that end."""
+            if direction < 0:
+                lo, hi = 0, clip_i
+            else:
+                lo, hi = clip_i, len(samples) - 1
+            if hi <= lo:
+                return 0.0
+            # Near-clip band on that side (where labels usually sit).
+            near = slice(lo, hi + 1)
+            g = gray_prof[near]
+            r = radii[near]
+            if g.size == 0:
+                return 0.0
+            # Bright & not thick like a connector => sticker evidence.
+            bright = g > 150
+            wireish = r < wire_ref * 1.5
+            return float(np.sum(bright & wireish)) + 0.05 * float(g.max())
 
-    # Choose side: toward the sticker (same side as yellow in your refs).
-    dir_pref = -1 if label_side_score(-1) >= label_side_score(+1) else +1
+        # Choose side: toward the sticker (same side as yellow in your refs).
+        dir_pref = -1 if label_side_score(-1) >= label_side_score(+1) else +1
 
-    def build_pick(direction):
-        edge_i = _walk_off_bulge(samples, radii, clip_i, direction, wire_ref)
-        pick_i = int(np.clip(edge_i + direction * extra, 0, len(samples) - 1))
-        t = float(samples[pick_i])
-        t = float(np.clip(t, t0 + margin, t1 - margin))
-        pick_i = int(np.argmin(np.abs(samples - t)))
-        # If we landed on white label, step back toward the clip onto dark wire.
-        for _ in range(extra + 8):
-            if gray_prof[pick_i] < 150 and radii[pick_i] <= wire_ref * 1.35:
-                break
-            pick_i = int(np.clip(pick_i - direction, 0, len(samples) - 1))
-        return pick_i, float(samples[pick_i])
+        def build_pick(direction):
+            edge_i = _walk_off_bulge(samples, radii, clip_i, direction, wire_ref)
+            pick_i = int(np.clip(edge_i + direction * extra, 0, len(samples) - 1))
+            t = float(samples[pick_i])
+            t = float(np.clip(t, t0 + margin, t1 - margin))
+            pick_i = int(np.argmin(np.abs(samples - t)))
+            # If we landed on white label, step back toward the clip onto dark wire.
+            for _ in range(extra + 8):
+                if gray_prof[pick_i] < 150 and radii[pick_i] <= wire_ref * 1.35:
+                    break
+                pick_i = int(np.clip(pick_i - direction, 0, len(samples) - 1))
+            return pick_i, float(samples[pick_i])
 
-    pick_i, pick_t = build_pick(dir_pref)
-    # If preferred side still looks bad (on bulge/label), try the other.
-    bad = gray_prof[pick_i] >= 150 or radii[pick_i] > wire_ref * 1.5
-    if bad:
-        alt_i, alt_t = build_pick(-dir_pref)
-        pick_i, pick_t = alt_i, alt_t
+        pick_i, pick_t = build_pick(dir_pref)
+        # If preferred side still looks bad (on bulge/label), try the other.
+        bad = gray_prof[pick_i] >= 150 or radii[pick_i] > wire_ref * 1.5
+        if bad:
+            alt_i, alt_t = build_pick(-dir_pref)
+            pick_i, pick_t = alt_i, alt_t
 
-    return _point_at_projection(pts, proj, dist, pick_t, band_px)
+        pt = _point_at_projection(pts, proj, dist, pick_t, band_px)
+        _log.info(f"pickup_point: uv={pt} clip_i={clip_i} dir={dir_pref}")
+        return pt
+    except Exception as e:
+        _log.exception(f"pickup_point failed: {e}")
+        raise
 
 
 def pickup_points_for_masks(masks, fraction=0.5, offset_px=45.0, image=None):
     """Return list of (x, y) or None for each mask."""
-    return [
-        pickup_point(m, fraction=fraction, offset_px=offset_px, image=image)
-        for m in (masks or [])
-    ]
+    try:
+        return [
+            pickup_point(m, fraction=fraction, offset_px=offset_px, image=image)
+            for m in (masks or [])
+        ]
+    except Exception as e:
+        _log.exception(f"pickup_points_for_masks failed: {e}")
+        raise
 
 
 def draw_pickup_points(image, points, radius=6, color=(0, 255, 255)):
     """Draw pickup markers (BGR, default yellow) on a copy of the image."""
-    out = image.copy()
-    r = max(1, int(radius))
-    for pt in points or []:
-        if pt is None:
-            continue
-        x, y = int(round(pt[0])), int(round(pt[1]))
-        cv2.circle(out, (x, y), r, color, -1, cv2.LINE_AA)
-        cv2.circle(out, (x, y), r + 2, (0, 0, 0), 1, cv2.LINE_AA)
-    return out
+    try:
+        out = image.copy()
+        r = max(1, int(radius))
+        for pt in points or []:
+            if pt is None:
+                continue
+            x, y = int(round(pt[0])), int(round(pt[1]))
+            cv2.circle(out, (x, y), r, color, -1, cv2.LINE_AA)
+            cv2.circle(out, (x, y), r + 2, (0, 0, 0), 1, cv2.LINE_AA)
+        return out
+    except Exception as e:
+        _log.exception(f"draw_pickup_points failed: {e}")
+        raise

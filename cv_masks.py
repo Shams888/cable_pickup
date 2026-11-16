@@ -2,6 +2,7 @@
 
 import cv2
 import numpy as np
+from loguru import logger as _log
 
 
 def _odd_ksize(ksize):
@@ -30,7 +31,8 @@ def _yolo_union_mask(yolo_masks, shape_hw):
     for raw in yolo_masks:
         try:
             union = np.maximum(union, _resize_mask(raw, shape_hw))
-        except Exception:
+        except Exception as e:
+            _log.exception(f"_yolo_union_mask: skip mask: {e}")
             continue
     return union
 
@@ -170,109 +172,120 @@ def join_instance_masks(
 
     Returns (joined_masks, joined_scores). Scores for a merged blob = max of members.
     """
-    h, w = shape_hw
-    if not masks:
+    try:
+        h, w = shape_hw
+        if not masks:
+            _log.info("join_instance_masks: no input masks")
+            return [], []
+
+        binary = []
+        piece_scores = []
+        pieces = []
+        for i, raw in enumerate(masks):
+            m = _resize_mask(raw, (h, w))
+            if int(m.sum()) < int(min_piece_area):
+                continue
+            ctrs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if not ctrs:
+                continue
+            binary.append(m)
+            piece_scores.append(float(scores[i]) if scores is not None else 1.0)
+            pieces.append(max(ctrs, key=cv2.contourArea))
+
+        n = len(binary)
+        if n == 0:
+            _log.info("join_instance_masks: no pieces after size filter")
+            return [], []
+        _log.info(
+            f"join_instance_masks: pieces={n} gap={max_gap_px} "
+            f"angle={max_join_angle_deg} lateral={max_lateral_px}"
+        )
+
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i, j):
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        lengths = [_contour_length(c) for c in pieces]
+        # Two already-long masks are whole cables, not sticker fragments.
+        long_thresh = max(float(min_length) * 0.75, 400.0)
+        info = [_piece_ends(c) for c in pieces]
+        cents = [_contour_centroid(c) for c in pieces]
+        for i in range(n):
+            for j in range(i + 1, n):
+                if lengths[i] >= long_thresh and lengths[j] >= long_thresh:
+                    continue
+                ends_i, dir_i = info[i]
+                ends_j, dir_j = info[j]
+                ok, _pair = _ends_should_join(
+                    ends_i, dir_i, ends_j, dir_j, max_gap_px, max_join_angle_deg, max_lateral_px
+                )
+                if not ok:
+                    continue
+                # Same cable fragments share one centerline; parallel neighbors do not.
+                axis = dir_i + dir_j
+                if float(np.dot(dir_i, dir_j)) < 0:
+                    axis = dir_i - dir_j
+                nrm = np.linalg.norm(axis)
+                if nrm < 1e-6:
+                    continue
+                axis = axis / nrm
+                delta = cents[j] - cents[i]
+                cent_lat = abs(float(delta[0] * (-axis[1]) + delta[1] * axis[0]))
+                if cent_lat > max(float(max_lateral_px) * 1.5, 50.0):
+                    continue
+                union(i, j)
+
+        groups = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        out_masks, out_scores = [], []
+        width = max(1, int(join_width_px))
+        for members in groups.values():
+            canvas = np.zeros((h, w), dtype=np.uint8)
+            score = 0.0
+            for i in members:
+                canvas = np.maximum(canvas, (binary[i] * 255).astype(np.uint8))
+                score = max(score, piece_scores[i])
+
+            # Bridges only inside this group (label gaps), not across all cables.
+            if len(members) > 1:
+                group_pieces = [pieces[i] for i in members]
+                _bridge_pieces_on_mask(
+                    canvas,
+                    group_pieces,
+                    max_gap_px,
+                    max_join_angle_deg,
+                    width,
+                    max_lateral_px,
+                    min_length,
+                )
+
+            contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            # One group -> one mask (largest CC if bridge failed to connect).
+            c = max(contours, key=cv2.contourArea)
+            if not _contour_passes_size(c, min_cable_area, min_length):
+                continue
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(mask, [c], -1, 1, thickness=-1)
+            out_masks.append(mask)
+            out_scores.append(score if score > 0 else 1.0)
+        _log.info(f"join_instance_masks: out={len(out_masks)} from {n} piece(s)")
+        return out_masks, out_scores
+    except Exception as e:
+        _log.exception(f"join_instance_masks failed: {e}")
         return [], []
-
-    binary = []
-    piece_scores = []
-    pieces = []
-    for i, raw in enumerate(masks):
-        m = _resize_mask(raw, (h, w))
-        if int(m.sum()) < int(min_piece_area):
-            continue
-        ctrs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not ctrs:
-            continue
-        binary.append(m)
-        piece_scores.append(float(scores[i]) if scores is not None else 1.0)
-        pieces.append(max(ctrs, key=cv2.contourArea))
-
-    n = len(binary)
-    if n == 0:
-        return [], []
-
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[rj] = ri
-
-    lengths = [_contour_length(c) for c in pieces]
-    # Two already-long masks are whole cables, not sticker fragments.
-    long_thresh = max(float(min_length) * 0.75, 400.0)
-    info = [_piece_ends(c) for c in pieces]
-    cents = [_contour_centroid(c) for c in pieces]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if lengths[i] >= long_thresh and lengths[j] >= long_thresh:
-                continue
-            ends_i, dir_i = info[i]
-            ends_j, dir_j = info[j]
-            ok, _pair = _ends_should_join(
-                ends_i, dir_i, ends_j, dir_j, max_gap_px, max_join_angle_deg, max_lateral_px
-            )
-            if not ok:
-                continue
-            # Same cable fragments share one centerline; parallel neighbors do not.
-            axis = dir_i + dir_j
-            if float(np.dot(dir_i, dir_j)) < 0:
-                axis = dir_i - dir_j
-            nrm = np.linalg.norm(axis)
-            if nrm < 1e-6:
-                continue
-            axis = axis / nrm
-            delta = cents[j] - cents[i]
-            cent_lat = abs(float(delta[0] * (-axis[1]) + delta[1] * axis[0]))
-            if cent_lat > max(float(max_lateral_px) * 1.5, 50.0):
-                continue
-            union(i, j)
-
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-
-    out_masks, out_scores = [], []
-    width = max(1, int(join_width_px))
-    for members in groups.values():
-        canvas = np.zeros((h, w), dtype=np.uint8)
-        score = 0.0
-        for i in members:
-            canvas = np.maximum(canvas, (binary[i] * 255).astype(np.uint8))
-            score = max(score, piece_scores[i])
-
-        # Bridges only inside this group (label gaps), not across all cables.
-        if len(members) > 1:
-            group_pieces = [pieces[i] for i in members]
-            _bridge_pieces_on_mask(
-                canvas,
-                group_pieces,
-                max_gap_px,
-                max_join_angle_deg,
-                width,
-                max_lateral_px,
-                min_length,
-            )
-
-        contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        # One group -> one mask (largest CC if bridge failed to connect).
-        c = max(contours, key=cv2.contourArea)
-        if not _contour_passes_size(c, min_cable_area, min_length):
-            continue
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(mask, [c], -1, 1, thickness=-1)
-        out_masks.append(mask)
-        out_scores.append(score if score > 0 else 1.0)
-    return out_masks, out_scores
 
 
 def suppress_overlapping_masks(masks, scores=None, overlap_thresh=0.1):
@@ -282,39 +295,47 @@ def suppress_overlapping_masks(masks, scores=None, overlap_thresh=0.1):
     Two masks overlap if intersection / min(area_i, area_j) >= overlap_thresh.
     Keep higher score (or larger area if scores tie / missing).
     """
-    if not masks:
-        return [], []
+    try:
+        if not masks:
+            return [], []
 
-    prepared = []
-    for i, raw in enumerate(masks):
-        m = (np.asarray(raw) > 0).astype(np.uint8)
-        area = int(m.sum())
-        if area == 0:
-            continue
-        score = float(scores[i]) if scores is not None else float(area)
-        prepared.append((m, score, area))
-
-    # Higher score first; break ties with larger area.
-    order = sorted(range(len(prepared)), key=lambda i: (prepared[i][1], prepared[i][2]), reverse=True)
-    kept_masks, kept_scores = [], []
-    thresh = float(overlap_thresh)
-
-    for i in order:
-        m, score, area = prepared[i]
-        overlaps = False
-        for kept in kept_masks:
-            inter = int(np.logical_and(m, kept).sum())
-            if inter == 0:
+        prepared = []
+        for i, raw in enumerate(masks):
+            m = (np.asarray(raw) > 0).astype(np.uint8)
+            area = int(m.sum())
+            if area == 0:
                 continue
-            smaller = min(area, int(kept.sum()))
-            if smaller > 0 and (inter / smaller) >= thresh:
-                overlaps = True
-                break
-        if not overlaps:
-            kept_masks.append(m)
-            kept_scores.append(score)
+            score = float(scores[i]) if scores is not None else float(area)
+            prepared.append((m, score, area))
 
-    return kept_masks, kept_scores
+        # Higher score first; break ties with larger area.
+        order = sorted(range(len(prepared)), key=lambda i: (prepared[i][1], prepared[i][2]), reverse=True)
+        kept_masks, kept_scores = [], []
+        thresh = float(overlap_thresh)
+
+        for i in order:
+            m, score, area = prepared[i]
+            overlaps = False
+            for kept in kept_masks:
+                inter = int(np.logical_and(m, kept).sum())
+                if inter == 0:
+                    continue
+                smaller = min(area, int(kept.sum()))
+                if smaller > 0 and (inter / smaller) >= thresh:
+                    overlaps = True
+                    break
+            if not overlaps:
+                kept_masks.append(m)
+                kept_scores.append(score)
+
+        _log.info(
+            f"suppress_overlapping_masks: {len(prepared)} -> {len(kept_masks)} "
+            f"(thresh={thresh})"
+        )
+        return kept_masks, kept_scores
+    except Exception as e:
+        _log.exception(f"suppress_overlapping_masks failed: {e}")
+        return [], []
 
 
 def _find_cable_contours(
@@ -374,10 +395,10 @@ def detect_cv_masks(
 
     Returns a list of uint8 binary masks (H x W), possibly empty.
     """
+    log = logger if logger is not None else _log
     try:
         if image is None or not isinstance(image, np.ndarray) or image.size == 0:
-            if logger is not None:
-                logger.error("detect_cv_masks: invalid image")
+            log.error("detect_cv_masks: invalid image")
             return []
 
         h, w = image.shape[:2]
@@ -404,17 +425,15 @@ def detect_cv_masks(
                 continue
             kept.append(mask)
 
-        if logger is not None:
-            logger.info(
-                f"detect_cv_masks: {len(kept)} new mask(s) "
-                f"(of {len(cables)} cables, ksize={_odd_ksize(gaussian_ksize)}, "
-                f"thresh={int(binary_threshold)}, gap={int(max_gap_px)}, "
-                f"min_len>={min_w:.0f})"
-            )
+        log.info(
+            f"detect_cv_masks: {len(kept)} new mask(s) "
+            f"(of {len(cables)} cables, ksize={_odd_ksize(gaussian_ksize)}, "
+            f"thresh={int(binary_threshold)}, gap={int(max_gap_px)}, "
+            f"min_len>={min_w:.0f})"
+        )
         return kept
     except Exception as e:
-        if logger is not None:
-            logger.error(f"detect_cv_masks failed: {e}")
+        log.exception(f"detect_cv_masks failed: {e}")
         return []
 
 
@@ -445,10 +464,12 @@ def overlay_masks(image, masks, color=(0, 255, 0), alpha=0.45, scores=None):
                         cv2.LINE_AA,
                     )
         return cv2.addWeighted(overlay, alpha, out, 1.0 - alpha, 0)
-    except Exception:
+    except Exception as e:
+        _log.exception(f"overlay_masks failed: {e}")
         try:
             return image.copy()
-        except Exception:
+        except Exception as e2:
+            _log.exception(f"overlay_masks fallback failed: {e2}")
             return image
 
 
